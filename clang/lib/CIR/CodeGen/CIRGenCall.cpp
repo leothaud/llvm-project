@@ -60,8 +60,9 @@ cir::FuncType CIRGenTypes::getFunctionType(const CIRGenFunctionInfo &info) {
   SmallVector<mlir::Type, 8> argTypes;
   argTypes.reserve(info.getNumRequiredArgs());
 
-  for (const CanQualType &argType : info.requiredArguments())
+  for (const CanQualType &argType : info.requiredArguments()) {
     argTypes.push_back(convertType(argType));
+  }
 
   return cir::FuncType::get(argTypes,
                             (resultType ? resultType : builder.getVoidTy()),
@@ -139,6 +140,44 @@ static void addNoBuiltinAttributes(mlir::MLIRContext &ctx,
   if (!nbFuncs.empty())
     attrs.set(cir::CIRDialect::getNoBuiltinsAttrName(),
               mlir::ArrayAttr::get(&ctx, nbFuncs.getArrayRef()));
+}
+
+/// CIR-specific parameter canonicalization used while arranging CIR function
+/// signatures. Unlike ASTContext::getCanonicalParamType, this preserves array
+/// parameter types rather than decaying them to pointers.
+static CanQualType getCIRCanonicalParamType(const ASTContext &astContext,
+                                            QualType ty) {
+  // Keep qualifiers/canonical sugar normalization but preserve array shape.
+  // Note: parameter declarations may carry adjusted/decayed wrappers.
+  // Unwrap those first, then inspect the original type-as-written.
+  const Type *tyPtr = ty.getTypePtrOrNull();
+  if (!tyPtr)
+    return astContext.getCanonicalParamType(ty);
+
+  if (const auto *adjTy = dyn_cast<AdjustedType>(tyPtr))
+    tyPtr = adjTy->getOriginalType().getTypePtrOrNull();
+  if (const auto *decTy = dyn_cast<DecayedType>(tyPtr))
+    tyPtr = decTy->getOriginalType().getTypePtrOrNull();
+
+  if (!tyPtr)
+    return astContext.getCanonicalParamType(ty);
+
+  if (const auto *arrTy = tyPtr->getAsArrayTypeUnsafe()) {
+    QualType elemTy = arrTy->getElementType().getCanonicalType();
+    if (const auto *cat = dyn_cast<ConstantArrayType>(arrTy)) {
+      QualType canonArr = astContext.getConstantArrayType(
+          elemTy, cat->getSize(), cat->getSizeExpr(), ArraySizeModifier::Normal,
+          /*IndexTypeQuals=*/0);
+      return CanQualType::CreateUnsafe(canonArr);
+    }
+    if (isa<IncompleteArrayType>(arrTy)) {
+      QualType canonArr = astContext.getIncompleteArrayType(
+          elemTy, ArraySizeModifier::Normal, /*IndexTypeQuals=*/0);
+      return CanQualType::CreateUnsafe(canonArr);
+    }
+  }
+
+  return astContext.getCanonicalParamType(ty);
 }
 
 /// Add denormal-fp-math and denormal-fp-math-f32 as appropriate for the
@@ -939,7 +978,7 @@ arrangeFreeFunctionLikeCall(CIRGenTypes &cgt, CIRGenModule &cgm,
 
   SmallVector<CanQualType, 16> argTypes;
   for (const CallArg &arg : args)
-    argTypes.push_back(cgt.getASTContext().getCanonicalParamType(arg.ty));
+    argTypes.push_back(getCIRCanonicalParamType(cgt.getASTContext(), arg.ty));
 
   CanQualType retType = fnType->getReturnType()->getCanonicalTypeUnqualified();
 
@@ -961,7 +1000,7 @@ const CIRGenFunctionInfo &CIRGenTypes::arrangeCXXConstructorCall(
   // FIXME: Kill copy.
   llvm::SmallVector<CanQualType, 16> argTypes;
   for (const auto &arg : args)
-    argTypes.push_back(astContext.getCanonicalParamType(arg.ty));
+    argTypes.push_back(getCIRCanonicalParamType(astContext, arg.ty));
 
   // +1 for implicit this, which should always be args[0]
   unsigned totalPrefixArgs = 1 + extraPrefixArgs;
@@ -1002,7 +1041,7 @@ const CIRGenFunctionInfo &CIRGenTypes::arrangeCXXMethodCall(
   // FIXME: Kill copy.
   llvm::SmallVector<CanQualType, 16> argTypes;
   for (const CallArg &arg : args)
-    argTypes.push_back(astContext.getCanonicalParamType(arg.ty));
+    argTypes.push_back(getCIRCanonicalParamType(astContext, arg.ty));
 
   assert(!cir::MissingFeatures::opCallFnInfoOpts());
   return arrangeCIRFunctionInfo(
@@ -1090,7 +1129,37 @@ CIRGenTypes::arrangeFunctionDeclaration(const FunctionDecl *fd) {
                                   noProto->getExtInfo(), RequiredArgs::All);
   }
 
-  return arrangeFreeFunctionType(funcTy.castAs<FunctionProtoType>());
+  // For CIR we intentionally preserve array parameter types in function
+  // interfaces. Build argument types from ParmVarDecls instead of canonical
+  // FunctionProtoType params (which may already be decayed).
+  CanQual<FunctionProtoType> protoTy = funcTy.castAs<FunctionProtoType>();
+  SmallVector<CanQualType, 16> argTypes;
+  argTypes.reserve(fd->getNumParams());
+
+  // ArrayRef<FunctionProtoType::ExtParameterInfo> extInfos =
+  // protoTy->getExtParameterInfos();
+  for (auto [idx, param] : llvm::enumerate(fd->parameters())) {
+    // Prefer type-as-written from source info when available. This preserves
+    // array declarator shape (e.g. `int x[2]`) for CIR function interfaces.
+    QualType writtenTy = param->getOriginalType();
+    if (const TypeSourceInfo *tsi = param->getTypeSourceInfo())
+      writtenTy = tsi->getType();
+    argTypes.push_back(getCIRCanonicalParamType(astContext, writtenTy));
+    // if (!extInfos.empty() && extInfos[idx].hasPassObjectSize())
+    //   argTypes.push_back(astContext.getCanonicalSizeType());
+  }
+
+  RequiredArgs required =
+      protoTy->isVariadic()
+          ? RequiredArgs::getFromProtoWithExtraSlots(
+                protoTy, getNumPassObjectSizeParams(protoTy.getTypePtr()))
+          : RequiredArgs::All;
+
+  assert(!cir::MissingFeatures::opCallFnInfoOpts());
+  assert(!cir::MissingFeatures::opCallCIRGenFuncInfoExtParamInfo());
+  return arrangeCIRFunctionInfo(protoTy->getReturnType().getUnqualifiedType(),
+                                /*isInstanceMethod=*/false, argTypes,
+                                protoTy->getExtInfo(), required);
 }
 
 RValue CallArg::getRValue(CIRGenFunction &cgf, mlir::Location loc) const {

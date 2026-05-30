@@ -2956,6 +2956,24 @@ void CIRGenModule::setCIRFunctionAttributes(GlobalDecl globalDecl,
                          retAttrs, callingConv, sideEffect,
                          /*attrOnCallSite=*/false, isThunk);
 
+  // Preserve source-level array parameter bounds on function arguments.
+  // Even when the ABI-level CIR function signature uses pointer parameters,
+  // this metadata exposes the original declarator bound (e.g. `int x[2]`).
+  if (const auto *fd = dyn_cast<FunctionDecl>(globalDecl.getDecl())) {
+    for (auto [idx, pvd] : llvm::enumerate(fd->parameters())) {
+      QualType writtenTy = pvd->getOriginalType();
+      if (const TypeSourceInfo *tsi = pvd->getTypeSourceInfo())
+        writtenTy = tsi->getType();
+
+      if (const auto *cat = dyn_cast_or_null<ConstantArrayType>(
+              getASTContext().getAsArrayType(writtenTy))) {
+        argAttrs[idx].set("cir.original_array_size",
+                          builder.getI64IntegerAttr(static_cast<int64_t>(
+                              cat->getSize().getZExtValue())));
+      }
+    }
+  }
+
   for (mlir::NamedAttribute attr : pal)
     func->setAttr(attr.getName(), attr.getValue());
 
